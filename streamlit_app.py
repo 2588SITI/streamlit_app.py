@@ -1,31 +1,33 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 
 st.set_page_config(page_title="TCAS Health Diagnostic Dashboard", layout="wide")
 
 st.title("📡 TCAS Health Diagnostic Dashboard")
 st.markdown("""
-This dashboard analyzes RF Communication between Trains (Locos) and Stations to identify if faults lie in the 
-**Train TCAS** or **Station TCAS** hardware/software.
+Analyze RF Communication health to distinguish between **Train TCAS** and **Station TCAS** issues.
+- **Hardware Issue:** Usually zero or near-zero communication (Complete failure).
+- **Software Issue:** Intermittent drops or lower percentage (Logic/Protocol failure).
 """)
 
 # --- Sidebar: File Uploads ---
-st.sidebar.header("Upload Data")
-rfcomm_file = st.sidebar.file_uploader("Upload RFCOMM CSV (e.g., ALL_RFCOMM_007.csv)", type="csv")
-trnmsnma_file = st.sidebar.file_uploader("Upload TRNMSNMA CSV (e.g., ALL_TRNMSNMA_0007.csv)", type="csv")
+st.sidebar.header("1. Upload Data")
+rfcomm_file = st.sidebar.file_uploader("Upload RFCOMM CSV", type="csv")
+trnmsnma_file = st.sidebar.file_uploader("Upload TRNMSNMA CSV", type="csv")
 
 def load_data(rf_file, tr_file):
+    # Load RFCOMM
     rf_df = pd.read_csv(rf_file)
-    # Data Cleaning for RFCOMM
     rf_df['Percentage'] = pd.to_numeric(rf_df['Percentage'], errors='coerce')
-    rf_df['Loco Id'] = rf_df['Loco Id'].astype(str)
-    rf_df['Station Id'] = rf_df['Station Id'].astype(str)
     
+    # CRITICAL: Convert Loco Id to String to treat as a NAME/Label
+    rf_df['Loco Id'] = rf_df['Loco Id'].astype(str).str.strip()
+    rf_df['Station Id'] = rf_df['Station Id'].astype(str).str.strip()
+    
+    # Load TRNMSNMA
     tr_df = pd.read_csv(tr_file, low_memory=False)
-    tr_df['Loco Id'] = tr_df['Loco Id'].astype(str)
-    tr_df['Station'] = tr_df['Station'].astype(str)
+    tr_df['Loco Id'] = tr_df['Loco Id'].astype(str).str.strip()
     
     return rf_df, tr_df
 
@@ -33,83 +35,83 @@ if rfcomm_file and trnmsnma_file:
     rf_df, tr_df = load_data(rfcomm_file, trnmsnma_file)
     
     # --- Filter Section ---
-    st.sidebar.subheader("Filters")
+    st.sidebar.subheader("2. Filters")
     all_locos = sorted(rf_df['Loco Id'].unique())
-    selected_locos = st.sidebar.multiselect("Select Train(s) [Loco Id]", all_locos, default=all_locos)
+    selected_locos = st.sidebar.multiselect("Select Train Nos", all_locos, default=all_locos)
     
     all_stations = sorted(rf_df['Station Id'].unique())
-    selected_stations = st.sidebar.multiselect("Select Station(s)", all_stations, default=all_stations)
+    selected_stations = st.sidebar.multiselect("Select Stations", all_stations, default=all_stations)
     
-    # Filtered Data
-    mask = rf_df['Loco Id'].isin(selected_locos) & rf_df['Station Id'].isin(selected_stations)
-    filtered_rf = rf_df[mask]
+    # Filter Data
+    filtered_rf = rf_df[rf_df['Loco Id'].isin(selected_locos) & rf_df['Station Id'].isin(selected_stations)]
     
-    # --- Metrics Calculation ---
-    # Train Health (Average across all stations)
-    train_health = filtered_rf.groupby('Loco Id')['Percentage'].mean().reset_index()
-    # Station Health (Average across all trains)
-    station_health = filtered_rf.groupby('Station Id')['Percentage'].mean().reset_index()
+    # --- Metrics Logic ---
+    train_summary = filtered_rf.groupby('Loco Id')['Percentage'].mean().reset_index()
+    station_summary = filtered_rf.groupby('Station Id')['Percentage'].mean().reset_index()
 
-    # --- Layout: Main Tabs ---
-    tab1, tab2, tab3 = st.tabs(["🚂 Train Analysis", "🏢 Station Analysis", "📊 Comparative Heatmap"])
+    # --- UI Tabs ---
+    tab1, tab2, tab3 = st.tabs(["🚂 Train Context", "🏢 Station Context", "📊 Health Matrix"])
 
     with tab1:
-        st.subheader("Train TCAS Health Context")
-        col1, col2 = st.columns([2, 1])
+        st.subheader("Train Health Analysis")
+        # Treat Loco Id as categorical for the axis
+        fig_train = px.bar(train_summary, x='Loco Id', y='Percentage', color='Percentage',
+                           color_continuous_scale='RdYlGn', range_color=[0, 100],
+                           title="Performance of Individual Trains across all Stations")
+        fig_train.update_xaxes(type='category') # Ensures all 5 digits show as labels
+        st.plotly_chart(fig_train, use_container_width=True)
         
-        with col1:
-            fig_train = px.bar(train_health, x='Loco Id', y='Percentage', 
-                               title="Average Communication Health per Train",
-                               color='Percentage', color_continuous_scale='RdYlGn', range_color=[0, 100])
-            st.plotly_chart(fig_train, use_container_width=True)
-            
-        with col2:
-            st.write("**Train Diagnostics**")
-            unhealthy_trains = train_health[train_health['Percentage'] < 95]
-            if not unhealthy_trains.empty:
-                for idx, row in unhealthy_trains.iterrows():
-                    problem_type = "Hardware" if row['Percentage'] < 50 else "Software/Interference"
-                    st.error(f"Loco {row['Loco Id']}: {row['Percentage']:.2f}% - Likely {problem_type} Issue")
-            else:
-                st.success("All selected trains performing well.")
+        # Diagnostic Advice
+        bad_trains = train_summary[train_summary['Percentage'] < 90]
+        if not bad_trains.empty:
+            for _, row in bad_trains.iterrows():
+                fault = "HARDWARE" if row['Percentage'] < 30 else "SOFTWARE/SIGNAL"
+                st.error(f"⚠️ Train {row['Loco Id']} failing! Health: {row['Percentage']:.1f}%. Possible {fault} fault.")
+        else:
+            st.success("All trains show healthy communication (>90%).")
 
     with tab2:
-        st.subheader("Station TCAS Health Context")
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            fig_stn = px.bar(station_health, x='Station Id', y='Percentage', 
-                             title="Average Communication Health per Station",
-                             color='Percentage', color_continuous_scale='RdYlGn', range_color=[0, 100])
-            st.plotly_chart(fig_stn, use_container_width=True)
-            
-        with col2:
-            st.write("**Station Diagnostics**")
-            unhealthy_stns = station_health[station_health['Percentage'] < 95]
-            if not unhealthy_stns.empty:
-                for idx, row in unhealthy_stns.iterrows():
-                    problem_type = "Hardware" if row['Percentage'] < 50 else "Software/Interference"
-                    st.warning(f"Station {row['Station Id']}: {row['Percentage']:.2f}% - Likely {problem_type} Issue")
-            else:
-                st.success("All selected stations performing well.")
+        st.subheader("Station Health Analysis")
+        fig_stn = px.bar(station_summary, x='Station Id', y='Percentage', color='Percentage',
+                         color_continuous_scale='RdYlGn', range_color=[0, 100],
+                         title="Performance of Stations across all Trains")
+        fig_stn.update_xaxes(type='category')
+        st.plotly_chart(fig_stn, use_container_width=True)
+
+        bad_stns = station_summary[station_summary['Percentage'] < 90]
+        if not bad_stns.empty:
+            for _, row in bad_stns.iterrows():
+                fault = "HARDWARE" if row['Percentage'] < 30 else "SOFTWARE/SIGNAL"
+                st.warning(f"🚨 Station {row['Station Id']} failing! Health: {row['Percentage']:.1f}%. Possible {fault} fault.")
+        else:
+            st.success("All stations show healthy communication.")
 
     with tab3:
         st.subheader("Train vs. Station Communication Matrix")
-        # Creating a pivot for the heatmap
+        # Pivot table for heatmap
         pivot_df = filtered_rf.pivot_table(index='Loco Id', columns='Station Id', values='Percentage', aggfunc='mean')
-        fig_heat = px.imshow(pivot_df, text_auto=True, color_continuous_scale='RdYlGn', 
-                             title="Health Matrix (%)", labels=dict(x="Station", y="Train", color="Health %"))
+        
+        # Heatmap with categorical axes
+        fig_heat = px.imshow(pivot_df, text_auto=".1f", color_continuous_scale='RdYlGn',
+                             labels=dict(x="Station ID", y="Train ID (Loco)", color="Health %"),
+                             title="Detailed Health Matrix")
+        
+        # Explicitly setting y-axis to category to show all 5 digits clearly
+        fig_heat.update_yaxes(type='category')
+        fig_heat.update_xaxes(type='category')
+        
         st.plotly_chart(fig_heat, use_container_width=True)
         
-        st.info("""
-        **How to read this:**
-        - A **Horizontal Red Line** indicates a specific Train failing at almost all stations (Train TCAS Issue).
-        - A **Vertical Red Line** indicates a specific Station failing with almost all trains (Station TCAS Issue).
+        st.markdown("""
+        **How to Diagnose:**
+        * **Horizontal Red Row:** This Train is failing at **all** stations. The problem is in the **Train TCAS Hardware/Software**.
+        * **Vertical Red Column:** This Station is failing for **all** trains. The problem is in the **Station TCAS Hardware/Software**.
+        * **Single Red Cell:** Likely a temporary environmental interference during that specific passage.
         """)
 
-    # --- Detailed Packet Data (TRNMSNMA) ---
-    with st.expander("View Detailed Transmission Packets (TRNMSNMA)"):
-        st.dataframe(tr_df[tr_df['Loco Id'].isin(selected_locos)].head(100))
+    # Data Table
+    with st.expander("Show Raw Data Table"):
+        st.write(filtered_rf)
 
 else:
-    st.info("Please upload both RFCOMM and TRNMSNMA CSV files to begin the analysis.")
+    st.info("Please upload both CSV files to generate the diagnostic dashboard.")
