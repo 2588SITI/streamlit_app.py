@@ -1,104 +1,117 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 
-# --- Page Config ---
-st.set_page_config(page_title="KAVACH SENTINEL PRO", layout="wide")
-st.title("🛡️ WR KAVACH RADIO DIAGNOSTIC & ROOT CAUSE SYSTEM")
+st.set_page_config(page_title="TCAS Health Diagnostic Dashboard", layout="wide")
 
-# --- Sidebar ---
-st.sidebar.header("📂 Data Input")
-nms_file = st.sidebar.file_uploader("Upload TRNMSNMA (NMS Log)", type=['csv'])
-rf_file = st.sidebar.file_uploader("Upload RFCOMM (Station Summary)", type=['csv'])
+st.title("📡 TCAS Health Diagnostic Dashboard")
+st.markdown("""
+Analyze RF Communication health to distinguish between **Train TCAS** and **Station TCAS** issues.
+- **Hardware Issue:** Usually zero or near-zero communication (Complete failure).
+- **Software Issue:** Intermittent drops or lower percentage (Logic/Protocol failure).
+""")
 
-if nms_file and rf_file:
-    # Load Data
-    df_nms = pd.read_csv(nms_file, low_memory=False)
-    df_rf = pd.read_csv(rf_file, low_memory=False)
+# --- Sidebar: File Uploads ---
+st.sidebar.header("1. Upload Data")
+rfcomm_file = st.sidebar.file_uploader("Upload RFCOMM CSV", type="csv")
+trnmsnma_file = st.sidebar.file_uploader("Upload TRNMSNMA CSV", type="csv")
 
-    # Data Cleaning
-    df_nms['Pkt Len'] = pd.to_numeric(df_nms['Pkt Len'], errors='coerce').fillna(0)
-    df_nms['Pkt Len2'] = pd.to_numeric(df_nms['Pkt Len2'], errors='coerce').fillna(0)
-    df_nms['Speed'] = pd.to_numeric(df_nms['Speed'], errors='coerce').fillna(0)
-    df_rf['Percentage'] = pd.to_numeric(df_rf['Percentage'], errors='coerce')
+def load_data(rf_file, tr_file):
+    # Load RFCOMM
+    rf_df = pd.read_csv(rf_file)
+    rf_df['Percentage'] = pd.to_numeric(rf_df['Percentage'], errors='coerce')
     
-    # Feature 1: Identify Downgrades
-    df_nms['Prev_Mode'] = df_nms['Mode'].shift(1)
-    downgrades = df_nms[(df_nms['Prev_Mode'] == 'FullSupervision') & (df_nms['Mode'] != 'FullSupervision')]
+    # CRITICAL: Convert Loco Id to String to treat as a NAME/Label
+    rf_df['Loco Id'] = rf_df['Loco Id'].astype(str).str.strip()
+    rf_df['Station Id'] = rf_df['Station Id'].astype(str).str.strip()
     
-    # --- Metrics Section ---
-    m1, m2, m3, m4 = st.columns(4)
-    r1_fail = (df_nms['Pkt Len'] < 10).mean() * 100
-    r2_fail = (df_nms['Pkt Len2'] < 10).mean() * 100
+    # Load TRNMSNMA
+    tr_df = pd.read_csv(tr_file, low_memory=False)
+    tr_df['Loco Id'] = tr_df['Loco Id'].astype(str).str.strip()
     
-    m1.metric("FS Downgrades", len(downgrades))
-    m2.metric("Radio 1 Health", f"{100-r1_fail:.1f}%")
-    m3.metric("Radio 2 Health", f"{100-r2_fail:.1f}%")
-    m4.metric("Avg. Station Health", f"{df_rf['Percentage'].mean():.1f}%")
+    return rf_df, tr_df
 
-    st.divider()
-
-    # --- NEW IMPORTANT FEATURE: ROOT CAUSE DIAGNOSIS ---
-    st.header("🔍 Intelligent Root Cause Diagnosis")
+if rfcomm_file and trnmsnma_file:
+    rf_df, tr_df = load_data(rfcomm_file, trnmsnma_file)
     
-    col_diag, col_map = st.columns([1, 1])
+    # --- Filter Section ---
+    st.sidebar.subheader("2. Filters")
+    all_locos = sorted(rf_df['Loco Id'].unique())
+    selected_locos = st.sidebar.multiselect("Select Train Nos", all_locos, default=all_locos)
+    
+    all_stations = sorted(rf_df['Station Id'].unique())
+    selected_stations = st.sidebar.multiselect("Select Stations", all_stations, default=all_stations)
+    
+    # Filter Data
+    filtered_rf = rf_df[rf_df['Loco Id'].isin(selected_locos) & rf_df['Station Id'].isin(selected_stations)]
+    
+    # --- Metrics Logic ---
+    train_summary = filtered_rf.groupby('Loco Id')['Percentage'].mean().reset_index()
+    station_summary = filtered_rf.groupby('Station Id')['Percentage'].mean().reset_index()
 
-    with col_diag:
-        st.subheader("Automated Fault Labeling")
-        # Logic to determine if Loco or Station is at fault
-        diff = abs(r1_fail - r2_fail)
-        low_stns = df_rf[df_rf['Percentage'] < 90]['Station Id'].unique()
+    # --- UI Tabs ---
+    tab1, tab2, tab3 = st.tabs(["🚂 Train Context", "🏢 Station Context", "📊 Health Matrix"])
 
-        if diff > 15:
-            st.error("🚩 **DIAGNOSIS: LOCO HARDWARE FAULT**")
-            st.write(f"Radio 1 and Radio 2 show a performance gap of {diff:.1f}%. This usually indicates a loose RF cable, faulty antenna, or Radio module failure on the Locomotive.")
-        elif len(low_stns) > 0:
-            st.warning("🚩 **DIAGNOSIS: TRACKSIDE/STATION FAULT**")
-            st.write(f"Both radios are failing similarly at stations: {', '.join(low_stns)}. The issue is likely the Station's TCC transmitter or signal shadowing.")
+    with tab1:
+        st.subheader("Train Health Analysis")
+        # Treat Loco Id as categorical for the axis
+        fig_train = px.bar(train_summary, x='Loco Id', y='Percentage', color='Percentage',
+                           color_continuous_scale='RdYlGn', range_color=[0, 100],
+                           title="Performance of Individual Trains across all Stations")
+        fig_train.update_xaxes(type='category') # Ensures all 5 digits show as labels
+        st.plotly_chart(fig_train, use_container_width=True)
+        
+        # Diagnostic Advice
+        bad_trains = train_summary[train_summary['Percentage'] < 90]
+        if not bad_trains.empty:
+            for _, row in bad_trains.iterrows():
+                fault = "HARDWARE" if row['Percentage'] < 30 else "SOFTWARE/SIGNAL"
+                st.error(f"⚠️ Train {row['Loco Id']} failing! Health: {row['Percentage']:.1f}%. Possible {fault} fault.")
         else:
-            st.success("✅ **DIAGNOSIS: SYSTEM HEALTHY**")
-            st.write("No systemic hardware failures detected.")
+            st.success("All trains show healthy communication (>90%).")
 
-    with col_map:
-        st.subheader("Failure Heatmap (By Location)")
-        # Identify where Packet Length was 0 (Packet Loss)
-        loss_df = df_nms[df_nms['Pkt Len'] == 0]
-        if not loss_df.empty:
-            fig_loc = px.histogram(loss_df, x='Abs Loc', nbins=50, title="Packet Loss Frequency by Absolute Location",
-                                  color_discrete_sequence=['#E74C3C'])
-            st.plotly_chart(fig_loc, use_container_width=True)
+    with tab2:
+        st.subheader("Station Health Analysis")
+        fig_stn = px.bar(station_summary, x='Station Id', y='Percentage', color='Percentage',
+                         color_continuous_scale='RdYlGn', range_color=[0, 100],
+                         title="Performance of Stations across all Trains")
+        fig_stn.update_xaxes(type='category')
+        st.plotly_chart(fig_stn, use_container_width=True)
 
-    st.divider()
+        bad_stns = station_summary[station_summary['Percentage'] < 90]
+        if not bad_stns.empty:
+            for _, row in bad_stns.iterrows():
+                fault = "HARDWARE" if row['Percentage'] < 30 else "SOFTWARE/SIGNAL"
+                st.warning(f"🚨 Station {row['Station Id']} failing! Health: {row['Percentage']:.1f}%. Possible {fault} fault.")
+        else:
+            st.success("All stations show healthy communication.")
 
-    # --- NEW IMPORTANT FEATURE: SPATIAL PERFORMANCE CORRELATION ---
-    st.header("📈 Spatial Performance Correlation")
-    st.write("This chart synchronizes Train Speed with Radio Reception to find the 'Dead Zones'.")
-    
-    # Creating a synchronized chart using Plotly
-    fig = go.Figure()
-    # Speed Line
-    fig.add_trace(go.Scatter(x=df_nms.index, y=df_nms['Speed'], name="Speed (kmph)", line=dict(color='blue', width=1)))
-    # Radio 1 Packets (Secondary Axis)
-    fig.add_trace(go.Scatter(x=df_nms.index, y=df_nms['Pkt Len'], name="Radio 1 Pkt", line=dict(color='rgba(255, 0, 0, 0.3)', width=1), yaxis="y2"))
-    
-    fig.update_layout(
-        xaxis_title="Log Timeline (Sequence)",
-        yaxis=dict(title="Speed (kmph)"),
-        yaxis2=dict(title="Packet Length", overlaying="y", side="right"),
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    with tab3:
+        st.subheader("Train vs. Station Communication Matrix")
+        # Pivot table for heatmap
+        pivot_df = filtered_rf.pivot_table(index='Loco Id', columns='Station Id', values='Percentage', aggfunc='mean')
+        
+        # Heatmap with categorical axes
+        fig_heat = px.imshow(pivot_df, text_auto=".1f", color_continuous_scale='RdYlGn',
+                             labels=dict(x="Station ID", y="Train ID (Loco)", color="Health %"),
+                             title="Detailed Health Matrix")
+        
+        # Explicitly setting y-axis to category to show all 5 digits clearly
+        fig_heat.update_yaxes(type='category')
+        fig_heat.update_xaxes(type='category')
+        
+        st.plotly_chart(fig_heat, use_container_width=True)
+        
+        st.markdown("""
+        **How to Diagnose:**
+        * **Horizontal Red Row:** This Train is failing at **all** stations. The problem is in the **Train TCAS Hardware/Software**.
+        * **Vertical Red Column:** This Station is failing for **all** trains. The problem is in the **Station TCAS Hardware/Software**.
+        * **Single Red Cell:** Likely a temporary environmental interference during that specific passage.
+        """)
 
-    # --- Filtered Table for Maintenance Audit ---
-    st.subheader("📋 Maintenance Audit Checklist")
-    audit_data = df_rf[df_rf['Percentage'] < 95][['Station Id', 'Loco Id', 'Percentage', 'Expected Count']]
-    if not audit_data.empty:
-        st.write("The following stations require **Immediate Antenna Alignment**:")
-        st.table(audit_data.sort_values(by='Percentage'))
-    else:
-        st.success("No stations require immediate maintenance based on this log.")
+    # Data Table
+    with st.expander("Show Raw Data Table"):
+        st.write(filtered_rf)
 
 else:
-    st.info("Please upload both CSV files to unlock the Root Cause Diagnostic Engine.")
+    st.info("Please upload both CSV files to generate the diagnostic dashboard.")
